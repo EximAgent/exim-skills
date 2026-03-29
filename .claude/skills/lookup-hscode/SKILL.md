@@ -2,10 +2,10 @@
 name: lookup-hscode
 description: >
   Look up HS (Harmonized System) codes by code number or product keyword.
-  Supports simple (fast, free) and advanced (LLM + semantic, costs API calls) modes.
+  Three modes: simple (lexical, free), hybrid (lexical + semantic), advanced (LLM expansion + hybrid).
   Use when you need to find an HS code for a product, look up what an HS code
   means, or find related tariff classifications.
-argument-hint: "[query] [--mode simple|advanced] [--level section|chapter|heading|subheading] [--limit N]"
+argument-hint: "[query] [--mode simple|hybrid|advanced] [--level section|chapter|heading|subheading] [--limit N]"
 ---
 
 # Lookup HS Code
@@ -20,12 +20,13 @@ python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "$ARGUMENTS"
 
 ## Search Modes
 
-| Mode | Cost | When to use |
-|------|------|-------------|
-| `simple` (default) | Free — no API calls | Query already uses HS terminology (e.g. "bovine meat", "swine", "iron tubes") or is an HS code |
-| `advanced` | Gemini API calls | Query uses informal/common terms that don't appear in HS nomenclature (e.g. "beef", "chicken", "steel pipes") |
+| Mode | API cost | Speed | When to use |
+|------|----------|-------|-------------|
+| `simple` (default) | Free | ~50ms | Query uses HS terminology ("bovine meat", "swine") or is an HS code |
+| `hybrid` | Embedding API only | ~1s | Query is clear but may benefit from semantic matching ("meat animals") |
+| `advanced` | LLM + embedding API | ~2s | Informal/common terms not in HS nomenclature ("beef", "chicken", "steel pipes") |
 
-**Decision guide for agents:** Use `simple` first. If results look irrelevant or empty, retry with `--mode advanced`.
+**Decision guide for agents:** Start with `simple`. If results look irrelevant or empty, try `hybrid`. Use `advanced` only for informal terms that need translation to HS nomenclature.
 
 ## Examples
 
@@ -34,10 +35,15 @@ python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "$ARGUMENTS"
 python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "bovine meat"
 python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "0102"
 python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "iron tubes"
-python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "swine" --level heading
 ```
 
-### Advanced mode — LLM expansion + semantic search
+### Hybrid mode — lexical + semantic search
+```bash
+python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "meat animals" --mode hybrid
+python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "organic chemicals" --mode hybrid
+```
+
+### Advanced mode — LLM expansion + hybrid search
 ```bash
 python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "beef" --mode advanced
 python ${CLAUDE_SKILL_DIR}/scripts/lookup.py "chicken" --mode advanced
@@ -60,7 +66,10 @@ from lookup import search_hscodes
 # Simple mode (default) — no API calls
 hits = asyncio.run(search_hscodes("bovine meat", limit=5))
 
-# Advanced mode — LLM expansion + semantic
+# Hybrid mode — lexical + semantic (embedding API only)
+hits = asyncio.run(search_hscodes("meat animals", limit=5, mode="hybrid"))
+
+# Advanced mode — LLM expansion + hybrid
 hits = asyncio.run(search_hscodes("beef", limit=5, mode="advanced"))
 
 # Code search (always simple)
@@ -77,9 +86,14 @@ for h in hits:
 - Lexical search on `code`, `name`, `full_path` with Typesense typo tolerance (2 typos)
 - No external API calls
 
+**Hybrid mode:**
+- Lexical search on `code`, `name`, `full_path` (same as simple)
+- Semantic vector search using Gemini query embedding against pre-computed HS code embeddings
+- Results merged: items found by both methods rank first
+
 **Advanced mode:**
 1. LLM expands query into HS terminology (e.g. "beef" → "beef bovine meat fresh frozen chilled boneless carcasses edible offal")
-2. Semantic vector search using Gemini query embedding against pre-computed HS code embeddings
+2. Hybrid search (lexical with expanded terms + semantic with original query embedding)
 3. Results merged: items found by both methods rank first
 
 ## HS Code Hierarchy
@@ -100,8 +114,8 @@ for h in hits:
 | `TYPESENSE_PORT` | `8108` | Typesense server port |
 | `TYPESENSE_PROTOCOL` | `http` | Protocol |
 | `TYPESENSE_HSCODES_COLLECTION` | `hscodes` | Collection name |
-| `GEMINI_API_KEY` | — | Required only for `--mode advanced` |
-| `GEMINI_MODEL_CONFIG` | `gemini-2.5-flash` | LLM model for query expansion (advanced mode only) |
+| `GEMINI_API_KEY` | — | Required for `hybrid` and `advanced` modes |
+| `GEMINI_MODEL_CONFIG` | `gemini-2.5-flash` | LLM model for query expansion (`advanced` mode only) |
 
 ## Setup (one-time)
 

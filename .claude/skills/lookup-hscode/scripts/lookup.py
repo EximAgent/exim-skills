@@ -2,11 +2,13 @@
 
 Supports three search modes:
   - simple (default): Fast lexical search with Typesense typo tolerance. No API calls.
-  - advanced:         LLM query expansion + semantic vector search. Uses Gemini API.
+  - hybrid:           Lexical + semantic vector search. Uses Gemini embedding API only.
+  - advanced:         LLM query expansion + hybrid search. Uses Gemini LLM + embedding APIs.
 
 Usage:
     python lookup.py "bovine meat"              # simple keyword search (default)
     python lookup.py "0102"                     # code search
+    python lookup.py "beef" --mode hybrid       # lexical + semantic (no LLM)
     python lookup.py "beef" --mode advanced     # LLM expansion + semantic search
     python lookup.py "01" --level chapter       # filter by level
 """
@@ -104,14 +106,16 @@ async def search_hscodes(
     Modes:
         simple:   Fast lexical search with Typesense typo tolerance. No API calls.
                   Best for queries already using HS terminology (e.g. "bovine meat").
-        advanced: LLM query expansion + semantic vector search. Uses Gemini API.
+        hybrid:   Lexical + semantic vector search. Uses Gemini embedding API only.
+                  Good middle ground — catches semantic matches without LLM cost.
+        advanced: LLM query expansion + hybrid search. Uses Gemini LLM + embedding APIs.
                   Best for common/informal terms (e.g. "beef", "chicken", "steel pipes").
 
     Args:
         query: HS code (e.g. "0102") or keyword (e.g. "beef").
         limit: Max results to return.
         level: Filter by level: section, chapter, heading, subheading.
-        mode: "simple" (default) or "advanced".
+        mode: "simple" (default), "hybrid", or "advanced".
 
     Returns:
         List of matching HS code records.
@@ -136,8 +140,13 @@ async def search_hscodes(
         results = client.collections[COLLECTION_NAME].documents.search(params)
         return [doc for _, doc in _extract_hits(results)]
 
-    # Advanced mode: LLM expansion + semantic search
-    search_query = await expand_query(query)
+    # hybrid and advanced both use semantic search
+    # advanced additionally expands the query with LLM
+    if mode == "advanced":
+        search_query = await expand_query(query)
+    else:
+        search_query = query
+
     query_embedding = await generate_query_embedding(query)
 
     lexical_params = {
@@ -209,7 +218,7 @@ def format_results(hits: list[dict]) -> str:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python lookup.py <query> [--mode simple|advanced] [--level section|chapter|heading|subheading] [--limit N]")
+        print("Usage: python lookup.py <query> [--mode simple|hybrid|advanced] [--level section|chapter|heading|subheading] [--limit N]")
         sys.exit(1)
 
     query = sys.argv[1]

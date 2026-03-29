@@ -40,10 +40,11 @@ Requires `GEMINI_API_KEY` for embedding generation. Embeddings are cached to `~/
 
 ### Search modes
 
-| Mode | Cost | Speed | Best for |
-|------|------|-------|----------|
+| Mode | API cost | Speed | Best for |
+|------|----------|-------|----------|
 | `simple` (default) | Free | ~50ms | Queries using HS terminology ("bovine meat", "swine", "iron tubes") or HS codes |
-| `advanced` | Gemini API calls | ~2s | Informal/common terms ("beef", "chicken", "steel pipes") |
+| `hybrid` | Embedding API only | ~1s | Query is clear but may benefit from semantic matching ("meat animals") |
+| `advanced` | LLM + embedding API | ~2s | Informal/common terms ("beef", "chicken", "steel pipes") |
 
 ### Search by HS code
 
@@ -59,13 +60,19 @@ Found 6 results for '0102' (mode=simple):
   ...
 ```
 
-### Search by keyword (simple)
+### Search by keyword (simple — lexical only)
 
 ```bash
 python .claude/skills/lookup-hscode/scripts/lookup.py "bovine meat"
 ```
 
-### Search by keyword (advanced — LLM expansion + semantic)
+### Search by keyword (hybrid — lexical + semantic)
+
+```bash
+python .claude/skills/lookup-hscode/scripts/lookup.py "meat animals" --mode hybrid
+```
+
+### Search by keyword (advanced — LLM expansion + hybrid)
 
 ```bash
 python .claude/skills/lookup-hscode/scripts/lookup.py "beef" --mode advanced
@@ -122,11 +129,18 @@ Section I    "Live animals; animal products"          (roman numeral)
 
 Typesense lexical search across `code`, `name`, and `full_path` fields with typo tolerance (up to 2 typos). No external API calls.
 
+### Hybrid mode
+
+1. **Lexical search** — same as simple mode
+2. **Semantic vector search** — the query is embedded via Gemini and compared against pre-computed HS code embeddings
+3. **Result merging** — items found by both methods rank first, then semantic-only, then lexical-only
+
 ### Advanced mode
 
 1. **LLM query expansion** — Gemini rewrites the query into formal HS nomenclature (e.g. "beef" becomes "beef bovine meat fresh frozen chilled boneless carcasses edible offal")
-2. **Semantic vector search** — The original query is embedded and compared against pre-computed HS code embeddings
-3. **Result merging** — Lexical hits (from expanded query) and semantic hits are merged: items found by both methods rank first, then semantic-only, then lexical-only
+2. **Lexical search** — uses the expanded query terms
+3. **Semantic vector search** — uses the original query embedding
+4. **Result merging** — items found by both methods rank first, then semantic-only, then lexical-only
 
 ## Environment variables
 
@@ -137,9 +151,9 @@ Typesense lexical search across `code`, `name`, and `full_path` fields with typo
 | `TYPESENSE_PORT` | `8108` | All modes |
 | `TYPESENSE_PROTOCOL` | `http` | All modes |
 | `TYPESENSE_HSCODES_COLLECTION` | `hscodes` | All modes |
-| `GEMINI_API_KEY` | — | Indexing + advanced mode |
+| `GEMINI_API_KEY` | — | Indexing + hybrid/advanced modes |
 | `GEMINI_MODEL_CONFIG` | `gemini-2.5-flash` | Advanced mode (query expansion) |
-| `EMBEDDING_MODEL_CONFIG` | `gemini-embedding-001` | Indexing + advanced mode |
+| `EMBEDDING_MODEL_CONFIG` | `gemini-embedding-001` | Indexing + hybrid/advanced modes |
 
 ## Files
 
@@ -151,5 +165,5 @@ scripts/
   SKILL.md                  # Claude Code skill definition (agent instructions)
   README.md                 # This file (human documentation)
   scripts/
-    lookup.py               # Search script (simple + advanced modes)
+    lookup.py               # Search script (simple, hybrid, advanced modes)
 ```
