@@ -1,0 +1,91 @@
+# =============================================================================
+# Model Configuration — Trade Company Agent Skills
+# =============================================================================
+# Format: provider/model-name
+#
+# Supported providers:
+#   openai     — OpenAI API (also works with any OpenAI-compatible endpoint)
+#   anthropic  — Anthropic API
+#   gemini     — Google Gemini API
+#
+# Each entry maps a friendly config key to a provider/model + generation params.
+# Switch models by changing the config key in .env (e.g., GEMINI_MODEL_CONFIG=gemini-2.5-pro)
+#
+# Custom OpenAI-compatible endpoints (e.g., Ollama, LiteLLM, OpenRouter):
+#   Set api_base_url and api_key_env in generation_config.
+# =============================================================================
+
+# -- Gemini models (used for website finder LLM) --
+
+gemini-2.5-flash:
+  model: gemini/gemini-2.5-flash
+
+gemini-2.5-pro:
+  model: gemini/gemini-2.5-pro
+
+gemini-2.0-flash:
+  model: gemini/gemini-2.0-flash
+
+gemini-3-pro-preview:
+  model: gemini/gemini-3-pro-preview
+
+gemini-3-flash-preview:
+  model: gemini/gemini-3-flash-preview
+
+gemini-3.1-flash-lite-preview:
+  model: gemini/gemini-3.1-flash-lite-preview
+
+gemini-3.1-pro-preview:
+  model: gemini/gemini-3.1-pro-preview
+
+# -- OpenAI models (used for browser-use agent) --
+
+gpt-4o:
+  model: openai/gpt-4o
+
+gpt-4o-mini:
+  model: openai/gpt-4o-mini
+
+gpt-4.1:
+  model: openai/gpt-4.1
+
+# -- Anthropic models (used for browser-use agent) --
+
+claude-sonnet-4:
+  model: anthropic/claude-sonnet-4-20250514
+
+claude-opus-4:
+  model: anthropic/claude-opus-4-20250514
+
+# -- Embedding models --
+
+gemini-embedding-001:
+  model: gemini/gemini-embedding-001
+  generation_config:
+    embedding_dim: 3072
+
+gemini-embedding-2-preview:
+  model: gemini/gemini-embedding-2-preview
+  generation_config:
+    embedding_dim: 3072
+
+openai-text-embedding-3-small:
+  model: openai/text-embedding-3-small
+  generation_config:
+    embedding_dim: 1536
+
+# -- Custom endpoint examples (uncomment and configure) --
+
+# ollama-llama3:
+#   model: openai/llama3
+#   generation_config:
+#     api_base_url: http://localhost:11434/v1
+#     api_key_env: OLLAMA_API_KEY
+#     temperature: 0.1
+
+# openrouter-qwen:
+#   model: openai/qwen/qwen-2.5-72b
+#   generation_config:
+#     api_base_url: https://openrouter.ai/api/v1
+#     api_key_env: OPENROUTER_API_KEY
+#     temperature: 0.1
