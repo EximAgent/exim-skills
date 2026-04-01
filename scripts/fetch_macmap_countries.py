@@ -7,7 +7,10 @@ Usage:
 import os
 import sys
 
+from dotenv import load_dotenv
 import httpx
+
+load_dotenv()
 import typesense
 from typesense.exceptions import ObjectNotFound
 
@@ -41,19 +44,32 @@ def fetch_countries() -> list[dict]:
     url = "https://www.macmap.org/api/countries"
     headers = {
         "accept": "application/json, text/javascript, */*; q=0.01",
+        "accept-language": "en-US,en;q=0.9",
         "content-type": "application/json; charset=utf-8",
         "referer": "https://www.macmap.org/",
+        "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
         "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         "x-requested-with": "XMLHttpRequest",
     }
     cookies = {"Culture": "en"}
 
-    print(f"[fetch] Fetching countries from {url} ...")
-    resp = httpx.get(url, headers=headers, cookies=cookies, timeout=60, follow_redirects=True)
-    resp.raise_for_status()
-    data = resp.json()
-    print(f"[fetch] Got {len(data)} countries")
-    return data
+    # First visit the main page to get session cookies (ASP.NET_SessionId, F5 BIG-IP cookie)
+    print(f"[fetch] Establishing session with macmap.org ...")
+    with httpx.Client(headers=headers, cookies=cookies, timeout=60, follow_redirects=True, http2=True) as client:
+        landing = client.get("https://www.macmap.org/")
+        print(f"[fetch] Landing page status: {landing.status_code}")
+
+        print(f"[fetch] Fetching countries from {url} ...")
+        resp = client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        print(f"[fetch] Got {len(data)} countries")
+        return data
 
 
 def index_into_typesense(records: list[dict]) -> None:

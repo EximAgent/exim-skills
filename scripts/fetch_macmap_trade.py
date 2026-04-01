@@ -28,7 +28,10 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 import httpx
+
+load_dotenv()
 import typesense
 from typesense.exceptions import ObjectNotFound
 
