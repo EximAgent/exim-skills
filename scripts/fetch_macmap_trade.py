@@ -1,7 +1,11 @@
 """One-time script: crawl macmap.org trade data and index into Typesense.
 
-Fetches tariffs, trade remedies, NTM measures, and custom duties for
-reporter/partner/product combinations.
+Flow:
+1. For each reporter + HS subheading code → fetch NTLC (national tariff line)
+   product codes via /api/v2/ntlc-products
+2. For each NTLC code + partner → fetch tariffs, trade remedies, NTM measures,
+   and custom duties via /api/results/* endpoints
+3. Index results into Typesense
 
 Usage:
     # Crawl default shortlist of reporter countries
@@ -9,6 +13,9 @@ Usage:
 
     # Crawl specific reporters
     python scripts/fetch_macmap_trade.py --reporters 842,704,356
+
+    # Crawl specific reporters with specific partners
+    python scripts/fetch_macmap_trade.py --reporters 842 --partners 704,156,392
 
     # Limit total combos (for testing)
     python scripts/fetch_macmap_trade.py --reporters 842 --limit 10
@@ -87,6 +94,7 @@ TRADE_SCHEMA = {
         {"name": "partner_code", "type": "string", "facet": True},
         {"name": "partner_name", "type": "string"},
         {"name": "product_code", "type": "string", "facet": True},
+        {"name": "hs_code", "type": "string", "facet": True, "optional": True},
         {"name": "product_description", "type": "string", "optional": True},
         {"name": "applied_tariff", "type": "string", "facet": True, "optional": True},
         {"name": "ave_tariff", "type": "string", "optional": True},
@@ -276,6 +284,35 @@ async def fetch_all_endpoints(
     return results, needs_refresh
 
 
+async def fetch_ntlc_products(
+    client: httpx.AsyncClient,
+    reporter: str,
+    hs_code: str,
+    cookies: dict[str, str],
+) -> tuple[list[str], bool]:
+    """Fetch national tariff line codes for a reporter + HS subheading.
+
+    Returns (list_of_ntlc_codes, needs_cookie_refresh).
+    """
+    url = f"{BASE_URL}/api/v2/ntlc-products"
+    params = {"countryCode": reporter, "level": "8", "code": hs_code}
+
+    try:
+        resp = await client.get(url, params=params, headers=HEADERS, cookies=cookies, timeout=30)
+        if resp.status_code == 403:
+            return [], True
+        resp.raise_for_status()
+        data = resp.json()
+        # Extract product codes from response
+        if isinstance(data, list):
+            codes = [item.get("code") or item.get("Code") or item.get("ProductCode", "") for item in data]
+            return [c for c in codes if c], False
+        return [], False
+    except Exception as e:
+        print(f"  [error] ntlc-products {reporter}/{hs_code}: {e}")
+        return [], False
+
+
 # ---------------------------------------------------------------------------
 # Data extraction helpers
 # ---------------------------------------------------------------------------
@@ -287,6 +324,7 @@ def extract_document(
     partner_name: str,
     product: str,
     results: dict,
+    hs_code: str = "",
 ) -> dict | None:
     """Extract a Typesense document from API results. Returns None if all empty."""
 
@@ -313,6 +351,8 @@ def extract_document(
         "product_code": product,
         "crawled_at": int(time.time()),
     }
+    if hs_code:
+        doc["hs_code"] = hs_code
 
     summary_parts = []
 
@@ -421,12 +461,19 @@ def load_hs_products() -> list[str]:
 
 async def crawl(
     reporters: list[str],
+    partners: list[str] | None = None,
     limit: int | None = None,
     concurrency: int = 5,
     resume: bool = False,
     batch_delay: float = 0.2,
 ) -> None:
-    """Main crawl function."""
+    """Main crawl function.
+
+    Flow:
+    1. For each reporter + HS subheading code → fetch NTLC product codes
+    2. For each NTLC code + partner → fetch 4 results endpoints
+    3. Index into Typesense
+    """
 
     # Load reference data
     countries = load_countries()
@@ -434,15 +481,23 @@ async def crawl(
         print("[error] No countries loaded. Run fetch_macmap_countries.py first.")
         sys.exit(1)
 
-    products = load_hs_products()
-    if not products:
+    hs_codes = load_hs_products()
+    if not hs_codes:
         print("[error] No HS codes loaded. Run fetch_hscodes.py first.")
         sys.exit(1)
 
-    # Validate reporters
+    # Determine partner list (default: same as DEFAULT_REPORTERS)
+    partner_list = partners if partners else list(DEFAULT_REPORTERS)
+
+    # Validate reporters & partners
     for r in reporters:
         if r not in countries:
             print(f"[warn] Reporter code {r} not found in countries list")
+    for p in partner_list:
+        if p not in countries:
+            print(f"[warn] Partner code {p} not found in countries list")
+
+    print(f"[config] {len(reporters)} reporters × {len(hs_codes)} HS codes × {len(partner_list)} partners")
 
     # Load or reset checkpoint
     if resume:
@@ -458,36 +513,56 @@ async def crawl(
     # Get initial cookies
     cookies = await get_fresh_cookies()
 
-    # Build combo list
-    combos = []
-    for reporter in reporters:
-        partner_codes = [c for c in countries.keys() if c != reporter]
-        for partner in partner_codes:
-            for product in products:
-                if not is_completed(checkpoint, reporter, partner, product):
-                    combos.append((reporter, partner, product))
-
-    total_combos = len(combos)
-    print(f"[crawl] {total_combos} combos to process (skipping {len(checkpoint['completed'])} already done)")
-
-    if limit:
-        combos = combos[:limit]
-        print(f"[crawl] Limited to {limit} combos")
+    # NTLC code cache: (reporter, hs_code) -> list of NTLC codes
+    ntlc_cache: dict[str, list[str]] = {}
+    NTLC_CACHE_FILE = CACHE_DIR / "ntlc_cache.json"
+    if resume and NTLC_CACHE_FILE.exists():
+        with open(NTLC_CACHE_FILE) as f:
+            ntlc_cache = json.load(f)
+        print(f"[resume] Loaded {len(ntlc_cache)} cached NTLC lookups")
 
     # Crawl with concurrency control
     semaphore = asyncio.Semaphore(concurrency)
     batch_docs = []
     batch_count = 0
+    combo_count = 0
     cookie_lock = asyncio.Lock()
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
 
-        async def process_combo(reporter: str, partner: str, product: str) -> None:
-            nonlocal cookies, batch_count
+        async def get_ntlc_codes(reporter: str, hs_code: str) -> list[str]:
+            """Get NTLC codes, using cache when available."""
+            nonlocal cookies
+            cache_key = f"{reporter}_{hs_code}"
+            if cache_key in ntlc_cache:
+                return ntlc_cache[cache_key]
+
+            async with semaphore:
+                codes, needs_refresh = await fetch_ntlc_products(
+                    http_client, reporter, hs_code, cookies
+                )
+                if needs_refresh:
+                    async with cookie_lock:
+                        print("[cookie] Got 403 on NTLC lookup, refreshing cookies ...")
+                        cookies = await get_fresh_cookies()
+                        codes, _ = await fetch_ntlc_products(
+                            http_client, reporter, hs_code, cookies
+                        )
+                ntlc_cache[cache_key] = codes
+                await asyncio.sleep(batch_delay)
+                return codes
+
+        async def process_combo(
+            reporter: str, partner: str, ntlc_code: str, hs_code: str,
+        ) -> None:
+            nonlocal cookies, batch_count, combo_count
+
+            if is_completed(checkpoint, reporter, partner, ntlc_code):
+                return
 
             async with semaphore:
                 results, needs_refresh = await fetch_all_endpoints(
-                    http_client, reporter, partner, product, cookies
+                    http_client, reporter, partner, ntlc_code, cookies
                 )
 
                 # Refresh cookies if needed
@@ -495,19 +570,21 @@ async def crawl(
                     async with cookie_lock:
                         print("[cookie] Got 403, refreshing cookies ...")
                         cookies = await get_fresh_cookies()
-                        # Retry with new cookies
                         results, still_needs = await fetch_all_endpoints(
-                            http_client, reporter, partner, product, cookies
+                            http_client, reporter, partner, ntlc_code, cookies
                         )
                         if still_needs:
-                            print(f"  [error] Still getting 403 after cookie refresh for {reporter}/{partner}/{product}")
+                            print(f"  [error] Still 403 after refresh: {reporter}/{partner}/{ntlc_code}")
                             checkpoint["stats"]["errors"] += 1
                             return
 
                 reporter_name = countries.get(reporter, reporter)
                 partner_name = countries.get(partner, partner)
 
-                doc = extract_document(reporter, reporter_name, partner, partner_name, product, results)
+                doc = extract_document(
+                    reporter, reporter_name, partner, partner_name,
+                    ntlc_code, results, hs_code=hs_code,
+                )
 
                 checkpoint["stats"]["total"] += 1
                 if doc:
@@ -516,8 +593,9 @@ async def crawl(
                 else:
                     checkpoint["stats"]["empty"] += 1
 
-                mark_completed(checkpoint, reporter, partner, product)
+                mark_completed(checkpoint, reporter, partner, ntlc_code)
                 batch_count += 1
+                combo_count += 1
 
                 # Batch upsert and checkpoint every 100 combos
                 if batch_count % 100 == 0:
@@ -531,17 +609,50 @@ async def crawl(
                         batch_docs.clear()
 
                     save_checkpoint(checkpoint)
+                    # Also save NTLC cache
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    with open(NTLC_CACHE_FILE, "w") as f:
+                        json.dump(ntlc_cache, f)
+
                     stats = checkpoint["stats"]
                     print(
-                        f"[progress] {stats['total']}/{len(combos)} | "
+                        f"[progress] {stats['total']} processed | "
                         f"indexed={stats['indexed']} empty={stats['empty']} errors={stats['errors']}"
                     )
 
                 await asyncio.sleep(batch_delay)
 
-        # Process all combos
-        tasks = [process_combo(r, p, prod) for r, p, prod in combos]
-        await asyncio.gather(*tasks)
+        # Main crawl loop: reporter → HS code → NTLC lookup → partner × NTLC combos
+        stopped = False
+        for reporter in reporters:
+            if stopped:
+                break
+            print(f"\n[crawl] Reporter: {countries.get(reporter, reporter)} ({reporter})")
+
+            for hs_code in hs_codes:
+                if stopped:
+                    break
+
+                # Step 1: Get NTLC codes for this reporter + HS code
+                ntlc_codes = await get_ntlc_codes(reporter, hs_code)
+                if not ntlc_codes:
+                    continue
+
+                # Step 2: For each NTLC code × partner, fetch results
+                tasks = []
+                for ntlc_code in ntlc_codes:
+                    for partner in partner_list:
+                        if partner == reporter:
+                            continue
+                        if limit and combo_count >= limit:
+                            stopped = True
+                            break
+                        tasks.append(process_combo(reporter, partner, ntlc_code, hs_code))
+                    if stopped:
+                        break
+
+                if tasks:
+                    await asyncio.gather(*tasks)
 
     # Final flush
     if batch_docs:
@@ -553,8 +664,14 @@ async def crawl(
             print(f"[error] Final batch upsert failed: {e}")
 
     save_checkpoint(checkpoint)
+    # Save final NTLC cache
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(NTLC_CACHE_FILE, "w") as f:
+        json.dump(ntlc_cache, f)
+
     stats = checkpoint["stats"]
     print(f"\n[done] Crawl complete: indexed={stats['indexed']} empty={stats['empty']} errors={stats['errors']}")
+    print(f"[done] NTLC cache: {len(ntlc_cache)} reporter+HS lookups cached")
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +684,13 @@ def main():
         "--reporters",
         type=str,
         default=None,
-        help="Comma-separated country codes (default: shortlist of 15 key countries)",
+        help="Comma-separated reporter country codes (default: shortlist of 15 key countries)",
+    )
+    parser.add_argument(
+        "--partners",
+        type=str,
+        default=None,
+        help="Comma-separated partner country codes (default: same as reporters list)",
     )
     parser.add_argument("--limit", type=int, default=None, help="Max combos to crawl (for testing)")
     parser.add_argument("--concurrency", type=int, default=5, help="Max concurrent requests (default: 5)")
@@ -577,14 +700,17 @@ def main():
     args = parser.parse_args()
 
     reporters = args.reporters.split(",") if args.reporters else DEFAULT_REPORTERS
+    partners = args.partners.split(",") if args.partners else None
 
     print(f"[config] Reporters: {reporters}")
+    print(f"[config] Partners: {partners or 'same as reporters'}")
     print(f"[config] Concurrency: {args.concurrency}, Delay: {args.delay}s")
     if args.limit:
         print(f"[config] Limit: {args.limit}")
 
     asyncio.run(crawl(
         reporters=reporters,
+        partners=partners,
         limit=args.limit,
         concurrency=args.concurrency,
         resume=args.resume,
