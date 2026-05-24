@@ -11,3 +11,10 @@ build/
 .pytest_cache/
 .idea/
 .vscode/
+exim-front/
+
+# Trade data (proprietary — US govt $100/day subscription, Colombian DIAN)
+data/*.xlsx
+data/*.jsonl
+data/agent_results/
+data/logs/

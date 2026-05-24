@@ -2,202 +2,208 @@
 name: find-company-website
 description: >
   Find a company's official website/homepage given trade CSV data (company name, address,
-  HS code, product description, country). Strategy 1: Gemini LLM lookup. Strategy 2: Serper
-  Google Search + browser-use agent verification that visits candidate pages and compares
-  content against CSV data to confirm the match.
+  HS code, product description, country). Step 1: ask an LLM if it knows the company.
+  Step 2: search Google via Serper, read the raw results, and use agent-browser to
+  visit and verify candidates yourself. You can retry search with different queries up to 3 times.
 argument-hint: "[company_name] [address] [product_desc] [country]"
 ---
 
 # Find Company Website
 
-You are an agent that discovers the official website URL for a company given trade/customs CSV data.
+Given trade/customs CSV data about a company, find its official website URL.
 
-## When to Use This Skill
+## Why This Pipeline Exists
 
-Use this skill when:
-- You have a company name from a trade CSV file and need its website
-- You are enriching import/export records with company web data
-- You need to look up a company's homepage before extracting structured info with `/extract-company-info`
+Trade CSV data (US imports/exports) contains company names, addresses, HS codes, and product descriptions — but no website URLs. We need to enrich these records with the company's actual website so we can later extract structured company intelligence from it (via `/extract-company-info`).
+
+The challenge: trade data has messy company names ("SAMSNUG ELEC CO LTD"), abbreviations, and parent/subsidiary relationships. A simple Google search isn't enough — you need to verify that a URL actually belongs to the right company.
+
+## The Pipeline — Step by Step
+
+### Step 1: Ask a knowledgeable LLM
+
+A foundation model may already know the company and its website from training data. This is fast, cheap, and works well for well-known companies.
+
+```bash
+python ${CLAUDE_SKILL_DIR}/scripts/ask_llm.py '{"company_name": "SWIFT BEEF COMPANY", "address": "GREELEY, CO"}'
+```
+
+This returns the LLM's raw response. Read its reasoning — if it's convincing and specific, you may be done. If it's vague, hedging, or doesn't know, move to Step 2.
+
+### Step 2: Search Google + verify with agent-browser
+
+When the LLM doesn't know or you don't trust its answer, search Google. **You construct the search query** based on what you know about the company.
+
+```bash
+python ${CLAUDE_SKILL_DIR}/scripts/search_google.py "Swift Beef Company Greeley Colorado official website" "SWIFT BEEF COMPANY"
+```
+
+This returns raw Google results — titles, snippets, URLs. Read them.
+
+**If the domain + snippet already make it obvious** (e.g. `swiftbeef.com` — "Swift Beef Company | Premium Beef Products"), accept it directly — no browser needed.
+
+**If there are 2–3 plausible candidates** and you can't tell from the snippet alone (similar names, holding companies, subsidiaries), open them with agent-browser to confirm:
+
+```bash
+agent-browser open "https://candidate-url.com"
+agent-browser snapshot -c
+```
+
+Read the page. Does the content, company name, and products match? If yes, done. If you need to dig deeper:
+
+Core agent-browser workflow:
+1. `agent-browser open <url>` — Navigate to page (starts daemon on first call, reuses it after)
+2. `agent-browser snapshot -c` — Compact accessibility tree to read page content
+3. `agent-browser snapshot -i` — Interactive elements with refs (@e1, @e2) if you need to click
+4. `agent-browser click @e1` / `fill @e2 "text"` — Interact using refs
+
+**For batch verification — use named sessions, not open/close per company:**
+
+```bash
+# Open multiple candidates in parallel (same Chromium daemon, isolated contexts)
+agent-browser --session s1 open https://candidate1.com &
+agent-browser --session s2 open https://candidate2.com &
+agent-browser --session s3 open https://candidate3.com &
+wait
+
+# Snapshot each independently
+agent-browser --session s1 snapshot -c
+agent-browser --session s2 snapshot -c
+
+# Close all sessions at the end
+agent-browser close --all
+```
+
+Never `close` between companies — it kills the Chromium daemon and wastes the startup cost on the next call. Keep the daemon alive, use `--session <name>` for isolation, and `close --all` only when fully done.
+
+### Step 3: Retry with different queries — up to 3 rounds, batched
+
+A single search query often fails because the company name is abbreviated, the brand differs from the legal name, or the first query returns only directories. **You must retry** — giving up after one empty result is wrong.
+
+**In batch mode, retries work in rounds:**
+
+```python
+# Round 1: one query per uncertain company (all N of them)
+round1 = [
+    ("PULPAFRUIT Colombia fruit export", "PULPAFRUIT S A S"),
+    ("CHESAPEAKE SEAFOOD GROUP Colombia", "CHESAPEAKE SEAFOOD GROUP S.A.S."),
+    ("C.I. FLORCO flores Colombia exportacion", "C.I. FLORCO S.A."),
+    # ... all N uncertain companies
+]
+r1_results = asyncio.run(search_serper_batch(round1))
+
+# Read r1_results — find the subset with 0 candidates or only directory hits
+# Build NEW queries only for those failures, fire round 2
+round2 = [
+    ("pulpafruit.com", "PULPAFRUIT S A S"),              # rephrased
+    ("florco ciflowersofcolombia Colombia", "C.I. FLORCO S.A."),  # rephrased
+    # CHESAPEAKE found in round 1 — not included here
+]
+r2_results = asyncio.run(search_serper_batch(round2))
+
+# Still missing after round 2? One final round 3 for those stragglers only
+```
+
+When rephrasing a failed query, think about why it failed:
+- All directory results → add product type or drop generic words like "official website"
+- Zero results → try shorter name, drop legal suffix (S.A.S., LTDA), or try in Spanish
+- Subsidiary → search parent company name instead
+- Acronym → try the full expanded name
+
+After 3 rounds with no good candidate, mark as `not_found` — the company likely has no web presence.
 
 ## Input
 
-Parse arguments into a JSON object with these fields:
+| Field | Required | Example |
+|-------|----------|---------|
+| `company_name` | Yes | `SWIFT BEEF COMPANY` |
+| `address` | No | `1770 PROMONTORY CIRCLE, GREELEY, CO 80634` |
+| `product_desc` | No | `CARGO IS STOWED IN A REFRIGERATED CONTAINER` |
+| `country` | No | `KR, REPUBLIC OF KOREA` |
+| `hs_code` | No | `492740` |
 
-| Field | Required | Description | Example |
-|-------|----------|-------------|---------|
-| `company_name` | Yes | Company name from the CSV | `SWIFT BEEF COMPANY` |
-| `address` | No | Company address from CSV | `1770 PROMONTORY CIRCLE, GREELEY, CO 80634` |
-| `product_desc` | No | Product description or HS code description | `CARGO IS STOWED IN A REFRIGERATED CONTAINER` |
-| `country` | No | Country of origin/destination | `KR, REPUBLIC OF KOREA` |
-| `hs_code` | No | HS/tariff code | `492740` |
+## Batch Processing
 
-## How to Run
+Both `ask_llm.py` and `search_google.py` support native batch mode with async concurrency. Pass a list and get a list back — progress is shown via tqdm.
 
-### Single company lookup
-
-```bash
-python ${CLAUDE_SKILL_DIR}/scripts/find_website.py '{"company_name": "$ARGUMENTS"}'
-```
-
-If the user provides structured data, build the full JSON:
+**CLI** — always pass a JSON list, returns a list in the same order:
 
 ```bash
-python ${CLAUDE_SKILL_DIR}/scripts/find_website.py '{"company_name": "SWIFT BEEF COMPANY", "address": "1770 PROMONTORY CIRCLE, GREELEY, CO 80634", "product_desc": "REFRIGERATED CONTAINER", "country": "KR, REPUBLIC OF KOREA"}'
+python scripts/ask_llm.py '[{"company_name": "SWIFT BEEF COMPANY"}, {"company_name": "TYSON FOODS INC"}]'
 ```
-
-### Batch processing from CSV
 
 ```python
-import asyncio, csv, sys, os
+import asyncio, sys
 sys.path.insert(0, "${CLAUDE_SKILL_DIR}/scripts")
-from find_website import process_csv_row
+from ask_llm import ask_llm_batch
+from search_google import search_serper_batch
 
-async def batch():
-    with open("Exports.csv") as f:
-        for row in csv.DictReader(f):
-            result = await process_csv_row(row, "us_export")
-            print(f"{row['US_Exporter']}: {result['url']} (via {result['method']})")
+# Step 1: ask LLM about many companies at once (default 10 concurrent)
+companies = [
+    {"company_name": "SWIFT BEEF COMPANY", "address": "GREELEY, CO"},
+    {"company_name": "TYSON FOODS INC", "country": "US"},
+]
+results = asyncio.run(ask_llm_batch(companies))
+# results[i]["raw"] is the LLM's response for companies[i]
 
-asyncio.run(batch())
+# Step 2: search Google for many queries at once (default 5 concurrent)
+queries = [
+    ("Swift Beef Company Greeley CO official site", "SWIFT BEEF COMPANY"),
+    ("Tyson Foods Inc headquarters website", "TYSON FOODS INC"),
+]
+search_results = asyncio.run(search_serper_batch(queries))
+# search_results[i]["candidates"] is the list of Google hits for queries[i]
 ```
 
-Source type mapping:
-- `us_export` → `US_Exporter`, `US_Exporter_Address`, `Product_Detailed_Description`, `Country_of_Foreign_Port`, `HS_Code`
-- `us_import` → `Shipper Name`, `Consignee Name` + addresses, `Product Desc`, `Country`, `HS Code`
-- `co_export` → `RAZON_SOCIAL_EXPORTADOR`, `DIREC_EXPORTADOR`, `PAIS_DESTINO_FINAL`, `SUBPARTIDA`
+Concurrency defaults (override via env):
+- `ASK_LLM_CONCURRENCY` — parallel LLM calls (default: 10)
+- `SERPER_CONCURRENCY` — parallel Serper API calls (default: 5, keep low to avoid rate limits)
 
-## Strategy Design
+Serper has no native batch endpoint — parallel async calls with a semaphore is the right approach.
 
-### Strategy 1: Gemini LLM (quick knowledge lookup)
+## Output Formats
 
-- **Requires**: `GEMINI_API_KEY` (or whatever provider is set in `GEMINI_MODEL_CONFIG`)
-- **How**: Asks the LLM to identify the company's website from its training knowledge. Sends company name, address, product, and country as context.
-- **Best for**: Well-known companies, large exporters/importers with clear web presence.
-- **Accepts if**: URL returned + passes `validate_url()` (HTTP check, not a directory/parked domain).
-
-### Strategy 2: Serper Search + Browser Verification
-
-Two-phase approach that avoids Google CAPTCHAs:
-
-**Phase 1 — Serper API search** (`SERPER_API_KEY` required):
-- Searches Google via Serper.dev REST API (no browser, no CAPTCHA risk)
-- Returns up to 10 organic results, each scored by:
-  - Domain-name fuzzy match against company name (max +3.0)
-  - Title contains company name words (max +2.0)
-  - Snippet contains company name words (max +1.0)
-  - Bonus for being a homepage URL (+0.5)
-- Filters out directory sites (LinkedIn, Bloomberg, ImportGenius, etc.)
-
-**Phase 2a — High confidence (score >= 4.0)**:
-- If the top result scores high enough, accept it directly after basic `validate_url()` check.
-- No browser needed — the domain match + title match is strong enough.
-
-**Phase 2b — Browser verification (score < 4.0)**:
-- For ambiguous results, a browser-use agent visits each candidate (up to 3).
-- The agent reads the page content and compares against the CSV data:
-  - Does the company name match (or is it a parent/subsidiary)?
-  - Does the address or location match?
-  - Are the products/services consistent with the trade goods?
-- Agent returns YES/NO with reasoning.
-- First verified candidate is accepted.
-
-**Why not search Google with the browser?** Google CAPTCHAs and rate limits make direct browser search unreliable. Serper handles the search via API, and the browser only visits candidate company pages.
-
-## Output Format — Agent-Readable
-
-The script returns the **full results from both strategies** so you can reason about them. No hardcoded confidence thresholds — you decide what to accept.
+### ask_llm.py (Step 1)
 
 ```json
 {
-  "canonical_name": "SWIFT BEEF",
-  "input": {"company_name": "SWIFT BEEF COMPANY", "address": "GREELEY, CO", ...},
-  "gemini": {
-    "url": "https://swiftbeef.com",
-    "confidence": 8,
-    "reason": "Well-known US beef company headquartered in Greeley, CO",
-    "url_valid": true
-  },
-  "serper": {
-    "url": "https://swiftbeef.com",
-    "query": "SWIFT BEEF COMPANY GREELEY, CO official website",
-    "candidates": [
-      {"url": "https://swiftbeef.com", "score": 5.5, "title": "Swift Beef Company"},
-      {"url": "https://jbsusa.com", "score": 2.1, "title": "JBS USA - Parent Company"}
-    ]
-  },
-  "recommendation": {
-    "url": "https://swiftbeef.com",
-    "method": "serper_browser",
-    "company_id": "swiftbeef.com"
-  },
-  "status": "found"
+  "input": {"company_name": "SWIFT BEEF COMPANY", "address": "GREELEY, CO"},
+  "raw": "{\"url\": \"https://swiftbeef.com\", \"confidence\": 8, \"reason\": \"Well-known US beef company headquartered in Greeley, CO\"}"
 }
 ```
 
-### How to interpret the output
+The `raw` field is the LLM's response as-is. You parse it, read the reasoning, and decide whether to trust it.
 
-**`gemini`** — LLM knowledge lookup:
-- `confidence` (1-10): How sure the LLM is. 9-10 = certain, 5-6 = moderate, 1-2 = guessing.
-- `reason`: Why it chose this URL or why it's unsure. Read this to understand edge cases.
-- `url_valid`: Whether the URL passed HTTP liveness + parked domain checks.
+### search_google.py (Step 2)
 
-**`serper`** — Google search + browser verification:
-- `url`: The browser-verified URL (strongest evidence), or null if none verified.
-- `candidates`: Top 5 search results with relevance scores. Useful if the verified URL is null — you might want to investigate specific candidates.
-
-**`recommendation`** — The script's best guess. You can override this based on:
-- Gemini confidence + reason vs Serper candidate scores
-- Whether Gemini and Serper agree on the same URL (strong signal)
-- Whether the reason reveals ambiguity (subsidiary, parent company, rebranding)
-
-### Decision guidelines for the agent
-
-- **Both strategies agree** on the same URL → high confidence, accept it
-- **Gemini confidence >= 7** and `url_valid=true` → likely correct, accept unless reason raises concerns
-- **Gemini confidence 4-6** → moderate, check if Serper candidates confirm or contradict
-- **Gemini confidence <= 3** or no URL → rely on Serper results
-- **Serper has verified URL** (`serper.url` is not null) → browser confirmed the match, trust it
-- **No verified URL but candidates exist** → you may want to investigate the top candidates manually
-- **Both strategies return null** → company likely has no website, or name is too ambiguous
-
-## Storing Results in Typesense
-
-```python
-sys.path.insert(0, "path/to/extract-company-info/scripts")
-from db import get_typesense_client, init_schema, get_or_create_company, update_company_website
-
-client = get_typesense_client()
-init_schema(client)
-rec = result["recommendation"]
-if rec:
-    company_id = get_or_create_company(client, result["canonical_name"], rec["url"])
-    update_company_website(client, company_id, rec["url"], rec["method"])
+```json
+{
+  "query": "Swift Beef Company Greeley CO official website",
+  "candidates": [
+    {"url": "https://swiftbeef.com", "full_url": "https://swiftbeef.com/", "title": "Swift Beef Company - Premium Beef Products", "snippet": "Swift Beef Company is a leading producer...", "position": 1},
+    {"url": "https://jbsusa.com", "full_url": "https://jbsusa.com/our-brands/swift/", "title": "Swift - JBS USA", "snippet": "Swift is a brand of JBS USA...", "position": 2}
+  ]
+}
 ```
 
-## Required Environment Variables
+## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GEMINI_API_KEY` | Recommended | For Strategy 1 (Gemini LLM lookup) |
-| `SERPER_API_KEY` | Recommended | For Strategy 2 (Serper Google Search) |
-| `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` | Optional | For browser verification agent (Strategy 2b) |
-| `GEMINI_MODEL_CONFIG` | Optional | Models.yaml config key for LLM (default: `gemini-2.5-flash`) |
-| `BROWSER_MODEL_CONFIG` | Optional | Models.yaml config key for browser agent (default: `gpt-4o`) |
+| `GEMINI_API_KEY` | Recommended | For Step 1 (LLM knowledge lookup) |
+| `SERPER_API_KEY` | Recommended | For Step 2 (Google search) |
+| `KNOWLEDGE_MODEL_CONFIG` | Optional | Models.yaml config key for LLM |
 
-## Error Handling
+## Required Tools
 
-- If Gemini returns "UNKNOWN" or invalid URL → falls through to Strategy 2
-- If Serper returns no results → returns `not_found`
-- If browser-use is not installed → high-confidence Serper results still work, ambiguous ones are skipped
-- All errors captured in the `strategies` array for debugging
-- Never raises exceptions to the caller
+| Tool | Install |
+|------|---------|
+| `agent-browser` | `npm install -g agent-browser && agent-browser install` |
 
-## Scripts Reference
+## Scripts
 
 | File | Purpose |
 |------|---------|
-| `scripts/find_website.py` | Main orchestrator — 2-strategy cascade |
-| `scripts/strategy_gemini.py` | Gemini LLM website identification |
-| `scripts/strategy_serper.py` | Serper search + browser-use verification |
-| `scripts/cross_validate.py` | URL validation, parked domain detection |
-| `scripts/normalize.py` | Company name normalization, fuzzy matching |
+| `scripts/ask_llm.py` | Step 1 — ask a foundation model if it knows the company's website |
+| `scripts/search_google.py` | Step 2 — search Google via Serper (agent constructs query, callable multiple times) |
+| `scripts/cross_validate.py` | Directory domain filtering (used internally by search_google.py) |

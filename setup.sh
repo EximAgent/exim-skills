@@ -44,7 +44,7 @@ info "Checking Python version..."
 PYTHON=""
 for cmd in python3.12 python3.11 python3; do
 	if command -v "$cmd" &>/dev/null; then
-		version=$("$cmd" --version 2>&1 | grep -oP '\d+\.\d+')
+		version=$("$cmd" --version 2>&1 | sed -n 's/.*Python \([0-9]*\.[0-9]*\).*/\1/p')
 		major=$(echo "$version" | cut -d. -f1)
 		minor=$(echo "$version" | cut -d. -f2)
 		if [[ "$major" -ge 3 && "$minor" -ge 11 ]]; then
@@ -185,12 +185,14 @@ pip install --quiet \
 	playwright \
 	openai \
 	anthropic \
-	litellm
+	litellm \
+	tqdm \
+	pycountry
 
 ok "Python dependencies installed"
 
 # =============================================================================
-# 4. Install Playwright Chromium
+# 4a. Install Playwright Chromium (for extract-company-info SPA fallback)
 # =============================================================================
 info "Installing Playwright Chromium browser..."
 
@@ -199,6 +201,30 @@ if $PYTHON -m playwright install chromium 2>/dev/null; then
 else
 	warn "Playwright Chromium install failed (may need: sudo playwright install-deps)"
 	echo "  Run manually: playwright install chromium"
+fi
+
+# =============================================================================
+# 4b. Install agent-browser (for find-company-website verification)
+# =============================================================================
+info "Installing agent-browser..."
+
+if command -v agent-browser &>/dev/null; then
+	ok "agent-browser is already installed ($(agent-browser --version 2>/dev/null || echo 'unknown version'))"
+else
+	if command -v npm &>/dev/null; then
+		npm install -g agent-browser 2>/dev/null && \
+			agent-browser install 2>/dev/null && \
+			ok "agent-browser installed via npm" || \
+			warn "agent-browser npm install failed, try: npm install -g agent-browser && agent-browser install"
+	elif command -v brew &>/dev/null; then
+		brew install agent-browser 2>/dev/null && \
+			ok "agent-browser installed via brew" || \
+			warn "agent-browser brew install failed, try: brew install agent-browser"
+	else
+		warn "agent-browser not installed. Install manually:"
+		echo "  npm install -g agent-browser && agent-browser install"
+		echo "  OR: brew install agent-browser"
+	fi
 fi
 
 # =============================================================================
@@ -246,7 +272,7 @@ echo "    /extract-company-info  — Extract + index company website data"
 echo ""
 echo "  Quick test:"
 echo "    source .env"
-echo "    python ${SKILLS_DIR}/find-company-website/scripts/find_website.py \\"
+echo "    python ${SKILLS_DIR}/find-company-website/scripts/ask_llm.py \\"
 echo "      '{\"company_name\": \"SWIFT BEEF COMPANY\", \"address\": \"GREELEY, CO\"}'"
 echo ""
 

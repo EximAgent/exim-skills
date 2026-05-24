@@ -67,7 +67,7 @@ import asyncio, csv, sys, os
 sys.path.insert(0, "path/to/find-company-website/scripts")
 sys.path.insert(0, "${CLAUDE_SKILL_DIR}/scripts")
 
-from find_website import process_csv_row
+from ask_llm import process_csv_row
 from extract_info import extract_company_info
 from db import get_typesense_client, init_schema, get_or_create_company, update_company_website
 
